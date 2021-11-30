@@ -46,6 +46,10 @@ The user should be able to query a list of the servers currently running
 
 The user should be able to identify any of the individual instances of the server running using an identifier provided at spawn
 
+### INFO_4_GAME_LOGS
+
+The user shall be able to read the logs of the game server if or when requested.
+
 ## Server shutdown
 
 ### SHUTDOWN_1_ANY_TIME
@@ -79,3 +83,11 @@ The module is not responsible for starting the docker swarm by itself, or adding
 ### TESTS_1_UNITS
 
 Unit tests should be implemented to test as much of the module as possible, including every single API endpoint made available to end users.
+
+## Errors
+
+Are considered errors :
+ - Any event happening as a response to an interaction with the docker Daemon that cannot reasonably be mitigated internally by the module and leaves the daemon in a state that was not desired by the user
+ - Any unexpected termination of a game server container.
+
+The first type will be transmitted to the end user using Python exceptions. For the latter, which is asynchronous, the module will spawn a watcher thread that preiodically monitors the health of the game servers it manages. If any server were to fail unexpectedly, a message would be sent along in a queue that the user can fetch.
