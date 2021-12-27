@@ -1,6 +1,6 @@
 """
 Mettaton, the simple wrapper around the Python Docker
-Library's Swarm Engine for Game Server Cluster Management
+Library's Engine for Game Server Cluster Management
 """
 import docker   # engine
 import logging  # logging library
@@ -12,74 +12,43 @@ from docker.types import ServiceMode, Placement
 from .utils import *   # Various utilities
 from .persistence import save_state, load_state, discard_state
 
+import urllib3
+# I understand the risks
+urllib3.disable_warnings()
+
+import random
+
 class Mettaton:
     """Mettaton, the friendly(?) server deployment manager"""
-    def __init__(self, cluster_config = {}, nfp = 5000, storage_path="/tmp/mettaton.state"):
+    def __init__(self, servers_ips, tls_params={}, storage_path="/tmp/mettaton.state"):
         """Initialize a Mettaton client.
         This will not perform the connection to the local docker
         client automatically. This is your own responsability to
         do with Mettaton.connect
         """
-        # Is the manager connected?
-        self.connected = False
-
-        # Client object to Docker Daemon
-        self.client = None
-
-        # Node identifier returned when creating/connecting
-        # To the swarm
-        self.raw_object = None
-
-        # A list of gaps in the list of ports available
-        self.available_ports = []
-
-        # The next known free port after which none are taken
-        self.next_free_port = nfp
-
-        # List of currently deployed servers
-        self.servers = {}
-
-        # Worker token to add servers to the swarm
-        self.worker_token = None
-
         # The logger
         self.logger = logging.getLogger("mettaton")
         self.logger.info("Built Mettaton")
 
-        # The configuration for the cluster
-        self.config = cluster_config
-
         # Path to persistent state storage
         self.storage_path = storage_path
 
-    def is_connected(self):
-        """Is the manager connected?"""
-        return self.connected
+        # TLS certificate parameters
+        self.tls_params = docker.tls.TLSConfig(
+                ca_cert=tls_params["ca_cert"],
+                client_cert=tls_params["client_cert"]
+        )
 
-    def connect(self):
-        """Connect mettaton to the local environment docker client"""
-        try:
-            self.client = docker.from_env()
-        except DockerException as e:
-            # TODO: Change this to have explicit errors
-            raise produce_appropriate_exception(e)
-        else:
-            self.logger.info("Connected to Docker Daemon")
-            self.connected = True
-        # TODO: This could fail, figure out all the ways it could
-        # and report them
+        # Docker container instances
+        self.instances = {}
 
-    def start_new_cluster(self):
-        """Start the Mettaton cluster, yielding the key that lets you connected to it"""
-        self.logger.debug("Initializing cluster...")
-        try:
-            self.client.swarm.init(**self.config)
-        except APIError as e:
-            raise produce_appropriate_exception(e)
+        # Attempt to load previous state
+        if self.load_state():
+            return # no need to go further
 
-        self._update_post_join_info()
-        self.logger.info("Initialized cluster successfully: %s", self.raw_object.get('ID'))
-        self.save_state()
+        # If that didn't work, build connections
+        # Client connections to the given server ips
+        self.build_connections(servers_ips)
 
     def save_state(self):
         """Save current state to persistent storage"""
@@ -95,7 +64,7 @@ class Mettaton:
         """Load a previous state from persistent storage"""
         self.logger.info("Reloading older state from persistent storage")
         try:
-            load_state(self.storage_path, self)
+            return load_state(self.storage_path, self)
         except RuntimeError as error:
             self.logger.error("Could not load state: %s", error)
         except FileNotFoundError as error:
@@ -104,108 +73,81 @@ class Mettaton:
         else:
             self.logger.info("Successfully reloaded state")
 
-    def regain_cluster(self):
-        """Regain control over an existing cluster"""
-        self.logger.info("Reloading cluster information...")
-        try:
-            self.client.swarm.reload()
-        except APIError as error:
-            raise produce_appropriate_exception(error)
-        self._update_post_join_info()
-        self.logger.info("Regained cluster successfully (swam id %s)", self.raw_object.get('ID'))
-        self.load_state()
+    def build_connections(self, ip_list):
+        """Build the dictionary of known connections from the given IP list"""
+        self.clients = {}
+        for ip_addr in ip_list:
+            client = docker.DockerClient(base_url="tcp://{}".format(ip_addr), tls=self.tls_params)
+            self.logger.info("Successful initial connection to %s", ip_addr)
+            self.clients[ip_addr] = client
 
-    def _update_post_join_info(self):
-        """Update and display vital information after successfully
-        connecting to/creating a swarm"""
-        self.raw_object = self.client.swarm.attrs
-        self.worker_token = self.raw_object.get("JoinTokens", {}).get("Worker")
-        self.logger.info("Worker join token is " + str(self.worker_token))
-
-    def shutdown(self, force=False):
-        if not self.connected:
-            raise RuntimeError("Not running")
-        if not self.raw_object:
-            raise RuntimeError("Cluster Not Started")
-        ret_status = self.client.swarm.leave(force=force)
-        if ret_status:
-            self.logger.info("Successfully left the cluster")
+    def start_server(self, image, name, environment={}, port_config={}, host=None):
+        """Start a game server somewhere in one of our managed connections"""
+        # If a host is provided, use it
+        if host is not None:
+            if not host in self.clients:
+                raise RuntimeError("Attempting connection to unknown client {}".format(host))
         else:
-            self.logger.error("Failure to leave the cluster")
+            # TODO: could be empty
+            host = random.choice(list(self.clients.keys()))
 
-        # Destroy on-disk state
-        try:
-            discard_state(self.storage_path)
-        except IOError:
-            self.logger.error("I/O error during state removal")
-        except FileNotFoundError:
-            pass
-        else:
-            self.logger.info("Successfully destroyed stale state")
-        return ret_status
+        client = self.clients[host]
 
-    def get_worker_token(self):
-        """Return the worker token needed by servers to join the cluster"""
-        return self.worker_token
+        container = client.containers.run(
+                image,
+                detach = True,
+                name = name,
+                restart_policy = { "Name": "always" },
+                network_mode = "bridge",
+                ports = port_config,
+                environment = environment)
 
-    def _find_next_free_port(self):
-        """Obtain the next free port in our range"""
-        if len(self.available_ports) == 0:
-            self.next_free_port += 1
-            return self.next_free_port
-        port = self.available_ports.pop(0)
-        return port
+        # Save the container
+        self.instances[container.id] = (host, container)
+        self.logger.info("Successful creation of docker %s named %s (image %s)", container.id, name, image)
 
-    def launch_server(self, image, exposition_port = 80,
-            server = None, port = None,
-            **kwargs):
-        """Deploy a server somewhere in the cluster"""
-        # TODO: Check validity of arguments
-        identifier = generate_identifier()
-        # The collision probability is very small
-        while self.servers.get(identifier):
-            identifier = generate_identifier()
+        self.save_state()
 
-        # Create a service
-        # That service will be one replica
-        mode = ServiceMode("replicated", replicas=1)
+        return host, container.id
 
-        # If we are given a host, constraint ourselves to it
-        constraint = []
-        if server is not None:
-            constraint = ["node.ip=={}".format(server)]
+    def get_server_list(self):
+        # Return a list of the servers we are connected to
+        return list(self.clients.keys())
 
-        # Published in host mode on a port we either generate
-        # or we are given
-        if port is None:
-            # Assign the next free port by default
-            port = self._find_next_free_port()
-        else:
-            # Just in case someone wants to be a trickster and sends us
-            # a port that is not a string but parses as an int
-            port = int(port)
-            # No, I will not catch the resulting exception. If someone
-            # does garbage with this module they might as well own up
-            # to it
-            if port in self.available_ports:
-                self.available_ports.remove(port)
-            elif port == self.next_free_port:
-                self.next_free_port += 1
-        port_dict = {}
-        port_dict[port] = int(exposition_port)
-        epspec = EndpointSpec(ports = port_dict)
-        # Create its endpoint specifications
-        kwargs["maxreplicas"] = 1
+    def get_instance_list(self):
+        # Return a list of instances we have launched
+        return list(self.instances.keys())
+    
+    def get_logs(self, instance_id, **kwargs):
+        if not instance_id in self.instances:
+            raise RuntimeError("No such instance known")
 
-        kwargs["name"] = "server-" + str(identifier)
-        self.logger.info("Launching image '%s' called %s (ports=%s, constraints=%s)", image, kwargs["name"], port_dict, constraint)
+        host, container = self.instances[instance_id]
+        return container.logs(**kwargs)
 
-        try:
-            self.servers[identifier] = self.client.services.create(image,
-                    constraints = constraint,
-                    endpoint_spec = epspec,
-                    **kwargs).id
-        except APIError as error:
-            raise produce_appropriate_exception(error)
+    def get_log_stream(self, instance_id, **kwargs):
+        if not instance_id in self.instances:
+            raise RuntimeError("No such instance known")
 
+        host, container = self.instances[instance_id]
+        return container.logs(stream=True, **kwargs)
+
+
+    def get_status(self, instance_id):
+        if not instance_id in self.instances:
+            raise RuntimeError("No such instance known")
+
+        host, container = self.instances[instance_id]
+        container.update()
+        return container.status
+
+    def shutdown_server(self, instance_id):
+        if not instance_id in self.instances:
+            raise RuntimeError("No such instance known")
+
+        host, container = self.instances[instance_id]
+        container.stop()
+        self.logger.info("Stopped container %s on %s", instance_id, host)
+        container.remove()
+        self.logger.info("Removed container %s on %s", instance_id, host)
         self.save_state()
