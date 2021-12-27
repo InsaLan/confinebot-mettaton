@@ -9,7 +9,8 @@ from docker.errors import DockerException, APIError
 from docker.types.services import EndpointSpec
 from docker.types import ServiceMode, Placement
 
-from .utils import *   # Various utilities
+from .utils import *    # Various utilities
+from .errors import *   # All of our error types
 from .persistence import save_state, load_state, discard_state
 
 import urllib3
@@ -65,6 +66,8 @@ class Mettaton:
         self.logger.info("Reloading older state from persistent storage")
         try:
             return load_state(self.storage_path, self)
+        except SaveStateParseError:
+            self.logger.error("Unable to parse saved state")
         except RuntimeError as error:
             self.logger.error("Could not load state: %s", error)
         except FileNotFoundError as error:
@@ -93,14 +96,19 @@ class Mettaton:
 
         client = self.clients[host]
 
-        container = client.containers.run(
-                image,
-                detach = True,
-                name = name,
-                restart_policy = { "Name": "always" },
-                network_mode = "bridge",
-                ports = port_config,
-                environment = environment)
+        try:
+            container = client.containers.run(
+                    image,
+                    detach = True,
+                    name = name,
+                    restart_policy = { "Name": "always" },
+                    network_mode = "bridge",
+                    ports = port_config,
+                    environment = environment)
+        except APIError as e:
+            appropriate_error = produce_appropriate_exception(e)
+            self.logger.error("%s", appropriate_error)
+            raise appropriate_error
 
         # Save the container
         self.instances[container.id] = (host, container)

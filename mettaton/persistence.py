@@ -4,6 +4,8 @@ import json
 import logging
 import os
 
+from .errors import SaveStateParseError
+
 log = logging.getLogger('mettaton.persistence')
 
 def save_state(path: str, meta):
@@ -12,17 +14,20 @@ def save_state(path: str, meta):
     with open(path, "w") as fptr:
         dct_data = {}
         dct_data['servers'] = list(meta.clients.keys())
-        dct_data['instances'] = {k: h for (k, (h, _)) in meta.instances.entries()}
+        dct_data['instances'] = {k: h for (k, (h, _)) in meta.instances.items()}
         json.dump(dct_data, fptr)
 
 def load_state(path: str, meta):
     """Load a state for the manager object from a given file path"""
 
     with open(path, "r") as fptr:
-        dct_data = json.load(fptr)
+        try:
+            dct_data = json.load(fptr)
+        except json.decoder.JSONDecodeError:
+            raise SaveStateParseError()
 
     meta.build_connections(dct_data['servers'])
-    for key, host in dct_data['instances'].entries():
+    for key, host in dct_data['instances'].items():
         conn = meta.clients[host]
         container = conn.containers.get(key)
         if container is not None:
