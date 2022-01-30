@@ -22,7 +22,7 @@ class HealthChecker(Thread):
     def __init__(self, connections):
         Thread.__init__(self)
         self.o_queue = Queue()
-        self.clients = connections
+        self.clients = connections.copy()
         self.clients_lock = Lock()
         self.watch_for_list = []
         self.watch_for_lock = Lock()
@@ -46,7 +46,10 @@ class HealthChecker(Thread):
 
     def disconnect(self, endpoint):
         self.clients_lock.acquire()
-        del self.clients[endpoint]
+        try:
+            del self.clients[endpoint]
+        except KeyError:
+            self.logger.warning("HealthChecker did not have a connection to %s", endpoint)
         self.clients_lock.release()
         self.logger.info("Disconnected from %s", endpoint)
 
@@ -100,7 +103,6 @@ class HealthChecker(Thread):
             self.clients_lock.release()
             return
 
-        #print(container.attrs['State']['Health'])
         status = container.attrs['State']['Health']['Status']
         if self.last_known.get(ident, "UNKNOWN") != status:
             self.last_known[ident] = status
