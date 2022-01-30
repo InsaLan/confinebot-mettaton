@@ -14,8 +14,11 @@ def produce_appropriate_exception(exc):
         return RuntimeError("Generated ID somehow invalid domain name")
     if "to be able to reuse that name." in string_representation:
         return ContainerNameAlreadyInuse(exc)
-    else:
-        return RuntimeError(string_representation)
+    if "SSL: WRONG_VERSION_NUMBER" in string_representation:
+        return DockerConnectSSLWrongVersionNumber(exc)
+    if "port is already allocated" in string_representation:
+        return DockerNetworkPortAlreadyAllocated(exc)
+    return RuntimeError(string_representation)
 
 def generate_identifier():
     """Generate a random identifier for servers"""

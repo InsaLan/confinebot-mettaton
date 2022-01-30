@@ -4,6 +4,8 @@ import json
 import logging
 import os
 
+from docker.errors import NotFound
+
 from .errors import SaveStateParseError
 
 log = logging.getLogger('mettaton.persistence')
@@ -29,7 +31,11 @@ def load_state(path: str, meta):
     meta.build_connections(dct_data['servers'])
     for key, host in dct_data['instances'].items():
         conn = meta.clients[host]
-        container = conn.containers.get(key)
+        container = None
+        try:
+            container = conn.containers.get(key)
+        except NotFound as error:
+            log.error("ERROR: Server %s in persistence no longer found in docker daemon", key)
         if container is not None:
             meta.instances[key] = (host, container)
         # TODO don't fail silently
