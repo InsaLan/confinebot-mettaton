@@ -8,16 +8,20 @@ import logging  # logging library
 from docker.errors import DockerException, APIError
 from docker.types.services import EndpointSpec
 from docker.types import ServiceMode, Placement
+from requests.exceptions import SSLError
 
 from .utils import *    # Various utilities
 from .errors import *   # All of our error types
 from .persistence import save_state, load_state, discard_state
+from .healthchecker import HealthChecker
 
 import urllib3
 # I understand the risks
 urllib3.disable_warnings()
 
 import random
+from threading import Thread
+from queue import Queue
 
 class Mettaton:
     """Mettaton, the friendly(?) server deployment manager"""
@@ -27,9 +31,11 @@ class Mettaton:
         client automatically. This is your own responsability to
         do with Mettaton.connect
         """
+        # Valid state?
+        self.valid = True
+
         # The logger
         self.logger = logging.getLogger("mettaton")
-        self.logger.info("Built Mettaton")
 
         # Path to persistent state storage
         self.storage_path = storage_path
@@ -42,6 +48,14 @@ class Mettaton:
 
         # Docker container instances
         self.instances = {}
+        # Docker connections
+        self.clients = {}
+
+        # Nurse/Health Watch daemon
+        self.nurse = HealthChecker(self.clients)
+        self.event_queue = self.nurse.get_event_queue()
+        self.nurse.start()
+        self.logger.info("Built Mettaton")
 
         # Attempt to load previous state
         if self.load_state():
@@ -50,6 +64,16 @@ class Mettaton:
         # If that didn't work, build connections
         # Client connections to the given server ips
         self.build_connections(servers_ips)
+
+    def __del__(self):
+        if self.valid:
+            self.shutdown()
+
+    def disconnect_from_endpoint(self, endpoint: str) -> bool:
+        if endpoint in self.clients:
+            self.clients[endpoint].close()
+            del self.clients[endpoint]
+            self.nurse.disconnect(endpoint)
 
     def save_state(self):
         """Save current state to persistent storage"""
@@ -80,16 +104,24 @@ class Mettaton:
         """Build the dictionary of known connections from the given IP list"""
         self.clients = {}
         for ip_addr in ip_list:
-            client = docker.DockerClient(base_url="tcp://{}".format(ip_addr), tls=self.tls_params)
+            try:
+                client = docker.DockerClient(
+                        base_url="tcp://{}".format(ip_addr),
+                        tls=self.tls_params
+                )
+            except DockerException as error:
+                self.logger.fatal("Fatal error when initializing Docker daemon connection to %s : %s", ip_addr, error)
+                raise produce_appropriate_exception(error) from None
             self.logger.info("Successful initial connection to %s", ip_addr)
             self.clients[ip_addr] = client
+            self.nurse.add_connection(ip_addr, client)
 
     def start_server(self, image, name, environment={}, port_config={}, host=None):
         """Start a game server somewhere in one of our managed connections"""
         # If a host is provided, use it
         if host is not None:
             if not host in self.clients:
-                raise RuntimeError("Attempting connection to unknown client {}".format(host))
+                raise RuntimeError("Attempting connection to unknown client {}".format(host)) from None
         else:
             # TODO: could be empty
             host = random.choice(list(self.clients.keys()))
@@ -108,13 +140,15 @@ class Mettaton:
         except APIError as e:
             appropriate_error = produce_appropriate_exception(e)
             self.logger.error("%s", appropriate_error)
-            raise appropriate_error
+            raise appropriate_error from None
 
         # Save the container
         self.instances[container.id] = (host, container)
         self.logger.info("Successful creation of docker %s named %s (image %s)", container.id, name, image)
 
         self.save_state()
+        # Tell the nurse to check on them
+        self.nurse.watch_for(host, container.id)
 
         return host, container.id
 
@@ -149,13 +183,35 @@ class Mettaton:
         container.update()
         return container.status
 
+    def subscribe(self):
+        """
+        Subscribe to a Queue of events that will come from the watcher
+        daemon
+        """
+        return self.event_queue
+
+    def shutdown(self):
+        """Shut mettaton down"""
+        # Destroy the healthwatcher
+        self.nurse.stop()
+        self.nurse.join()
+        # Destroy the connections
+        old_clients = self.clients.copy()
+        for endpoint in old_clients:
+            self.disconnect_from_endpoint(endpoint)
+        self.clients.clear()
+        self.logger.info("Destroyed mettaton. Bye bye.")
+        self.valid = False
+
     def shutdown_server(self, instance_id):
         if not instance_id in self.instances:
             raise RuntimeError("No such instance known")
 
         host, container = self.instances[instance_id]
+        self.nurse.unwatch_for(host, instance_id)
         container.stop()
         self.logger.info("Stopped container %s on %s", instance_id, host)
         container.remove()
+        del self.instances[instance_id]
         self.logger.info("Removed container %s on %s", instance_id, host)
         self.save_state()
