@@ -41,10 +41,12 @@ class Mettaton:
         self.storage_path = storage_path
 
         # TLS certificate parameters
-        self.tls_params = docker.tls.TLSConfig(
-                ca_cert=tls_params["ca_cert"],
-                client_cert=tls_params["client_cert"]
-        )
+        self.tls_params = None
+        if tls_params is not None and tls_params.get("ca_cert") and tls_params.get("client_cert"):
+            self.tls_params = docker.tls.TLSConfig(
+                ca_cert=tls_params.get("ca_cert"),
+                client_cert=tls_params.get("client_cert")
+            )
 
         # Docker container instances
         self.instances = {}
@@ -58,11 +60,9 @@ class Mettaton:
         self.logger.info("Built Mettaton")
 
         # Attempt to load previous state
-        if self.load_state():
-            return # no need to go further
+        self.load_state()
 
-        # If that didn't work, build connections
-        # Client connections to the given server ips
+        # Build any additional connection that's provided to us
         self.build_connections(servers_ips)
 
     def __del__(self):
@@ -100,21 +100,23 @@ class Mettaton:
         else:
             self.logger.info("Successfully reloaded state")
 
-    def build_connections(self, ip_list):
+    def build_connections(self, endpoint_list):
         """Build the dictionary of known connections from the given IP list"""
-        self.clients = {}
-        for ip_addr in ip_list:
+        for endpoint in endpoint_list:
+            if endpoint in self.clients:
+                self.logger.info("Not renewing connection to endpoint %s", endpoint)
+                continue
             try:
                 client = docker.DockerClient(
-                        base_url="tcp://{}".format(ip_addr),
+                        base_url=format(endpoint),
                         tls=self.tls_params
                 )
             except DockerException as error:
-                self.logger.fatal("Fatal error when initializing Docker daemon connection to %s : %s", ip_addr, error)
+                self.logger.fatal("Fatal error when initializing Docker daemon connection to %s : %s", endpoint, error)
                 raise produce_appropriate_exception(error) from None
-            self.logger.info("Successful initial connection to %s", ip_addr)
-            self.clients[ip_addr] = client
-            self.nurse.add_connection(ip_addr, client)
+            self.logger.info("Successful initial connection to %s", endpoint)
+            self.clients[endpoint] = client
+            self.nurse.add_connection(endpoint, client)
 
     def start_server(self, image, name, environment={}, port_config={}, host=None):
         """Start a game server somewhere in one of our managed connections"""
@@ -123,7 +125,8 @@ class Mettaton:
             if not host in self.clients:
                 raise RuntimeError("Attempting connection to unknown client {}".format(host)) from None
         else:
-            # TODO: could be empty
+            if len(self.clients.keys()) == 0:
+                raise NoHostAvailable("No host available to deploy right now")
             host = random.choice(list(self.clients.keys()))
 
         client = self.clients[host]
