@@ -30,6 +30,9 @@ def load_state(path: str, meta):
 
     meta.build_connections(dct_data['servers'])
     for key, host in dct_data['instances'].items():
+        if not host in meta.clients:
+            log.error("Host %s for instance %s is not connected. Instance is lost.", host, key)
+            continue
         conn = meta.clients[host]
         container = None
         try:

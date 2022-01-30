@@ -22,3 +22,9 @@ class DockerNetworkPortAlreadyAllocated(RuntimeError):
     forwarded for another docker container
     """
     pass
+
+class NoHostAvailable(RuntimeError):
+    """
+    We tried to deploy a container, but we are not connected to any host
+    """
+    pass
