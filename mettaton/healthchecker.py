@@ -5,7 +5,7 @@ Module containing logic to check the state of a docker container
 
 import docker   # engine
 import logging  # logging library
-import time
+import time     # To check check cycle duration
 # Errors from docker's library
 from docker.errors import DockerException, APIError, NotFound
 from docker.types.services import EndpointSpec
@@ -19,7 +19,15 @@ from threading import Thread, Lock
 from queue import Queue, Empty
 
 class HealthChecker(Thread):
-    def __init__(self, connections):
+    """
+    The Health Checker is the thread that runs alongside a Mettaton object
+    in order to verify
+    """
+    def __init__(self, connections: list[docker.DockerClient]):
+        """
+        Initialization of a `HealthChecker` object requires nothing more than
+        a list of initial `DockerClient` objects.
+        """
         Thread.__init__(self)
         self.o_queue = Queue()
         self.clients = connections.copy()
@@ -32,19 +40,33 @@ class HealthChecker(Thread):
         self.logger.info("Built nurse healthchecker")
 
     def shutdown(self):
+        """
+        Shut the health checker down, and send the final
+        notification message (i.e. "None")
+        """
         # Final shutdown message
         self.o_queue.put(None)
 
     def get_event_queue(self) -> Queue:
+        """
+        Return the event queue to which the Health Checker posts.
+        """
         return self.o_queue
 
-    def add_connection(self, endpoint, client):
+    def add_connection(self, endpoint: str, client: docker.DockerClient):
+        """
+        Add a connection to a Docker daemon, given the provided `endpoint` (str)
+        and `DockerClient` client object.
+        """
         self.clients_lock.acquire()
         self.clients[endpoint] = client
         self.clients_lock.release()
         self.logger.info("Added connection to %s", endpoint)
 
-    def disconnect(self, endpoint):
+    def disconnect(self, endpoint: str):
+        """
+        Disconnect from the provided endpoint.
+        """
         self.clients_lock.acquire()
         try:
             del self.clients[endpoint]
@@ -54,6 +76,11 @@ class HealthChecker(Thread):
         self.logger.info("Disconnected from %s", endpoint)
 
     def watch_for(self, endpoint: str, ident: str) -> bool:
+        """
+        Add references to a container at `endpoint` with ID `ident` which state
+        needs to be watched.
+        Returns True if all went well.
+        """
         self.watch_for_lock.acquire()
         if not (endpoint, ident) in self.watch_for_list:
             self.logger.info("Now watching for %s / %s", endpoint, ident)
@@ -62,6 +89,10 @@ class HealthChecker(Thread):
         return True
 
     def unwatch_for(self, endpoint: str, ident: str) -> bool:
+        """
+        Tells the Health Checker to stop watching for the container `ident` at endpoint `endpoint`.
+        Returns True if all went well, False if the specified container was not being watched.
+        """
         self.watch_for_lock.acquire()
         if not (endpoint, ident) in self.watch_for_list:
             return False
@@ -71,18 +102,40 @@ class HealthChecker(Thread):
         return True
 
     def start(self):
+        """
+        Start the Health Checker thread.
+        """
         Thread.start(self)
         self.running = True
 
     def stop(self):
+        """
+        Stop the Health Checker thread.
+        """
         self.running = False
 
-    def check_container(self, endpoint, ident):
+    def check_container(self, endpoint: str, ident: str):
+        """
+        Internal method used by the Health Checker to check for the health of a specific
+        container at `endpoint` with identifier `ident`. The health status is obtained from
+        the attributes of the retrieved container object, which contains a key
+        ['State']['Health']['Status'].
+
+        The values can be "starting", "healthy", "unhealthy", and so on. "UNKNOWN" is another state
+        that can be returned when the health checker loses an endpoint. "NOT_FOUND" is a similar state
+        that does not exist within docker but is returned when the health checker still has the
+        associated endpoint for a container, but cannot find it there anymore.
+
+        Updates are only sent when the state of a container changes.
+
+        The status retrieved here is shoved into the event queue as the second element of a tuple
+        which first element is the combination `(endpoint, ident)` describing the container.
+        """
         container = None
         self.clients_lock.acquire()
         conn = self.clients.get(endpoint)
         watch = (endpoint, ident)
-        if conn is None and self.last_known[()]:
+        if conn is None and self.last_known[watch]:
             self.last_known[watch] = "UNKNOWN"
             self.o_queue.put((watch, "UNKNOWN"))
             self.clients_lock.release()
@@ -110,6 +163,13 @@ class HealthChecker(Thread):
         self.clients_lock.release()
 
     def run(self):
+        """
+        Mail loop.
+
+        Handles triggering the check for every watched container.
+        If the check cycle takes longer than a full second, do not wait.
+        Otherwise, wait until a full second has elapsed since the loop began.
+        """
         self.logger.info("Health check loop begins")
         while self.running:
             now = time.time()
